@@ -553,10 +553,53 @@ tbl_descriptive <- svy_clean |>
     bold_p(t = 0.05)
 
 tbl_descriptive
-data_clean <- data_clean |>
+
+# ---------------------------------------------------------------------------
+# Heatmap: survey-weighted condition prevalence by BMI category
+# ---------------------------------------------------------------------------
+
+# Calculate weighted prevalence (%) for each condition × BMI group
+heatmap_data <- condition_vars |>
+    map(\(cond) {
+        svy_clean |>
+            group_by(bmi_category) |>
+            summarise(
+                prevalence = survey_mean(
+                    as.numeric(.data[[cond]]),
+                    na.rm = TRUE
+                ) *
+                    100
+            ) |>
+            mutate(condition = cond)
+    }) |>
+    list_rbind() |>
     mutate(
-        bmi_category = fct_collapse(
-            bmi_category,
-            "normal_or_below" = c("underweight", "normal")
-        )
+        condition = str_replace_all(condition, "_", " ") |> str_to_title()
+    )
+
+# Plot
+ggplot(heatmap_data, aes(x = bmi_category, y = condition, fill = prevalence)) +
+    geom_tile(color = "white", linewidth = 0.5) +
+    geom_text(
+        aes(label = sprintf("%.1f%%", prevalence)),
+        size = 3,
+        color = "black"
+    ) +
+    scale_fill_gradient(
+        low = "#f7fbff",
+        high = "#2166ac",
+        name = "Prevalence (%)"
+    ) +
+    labs(
+        title = "Condition Prevalence by BMI Category",
+        subtitle = "Medicare beneficiaries, 2020 & 2022 | Survey-weighted estimates",
+        x = "BMI Category",
+        y = NULL
+    ) +
+    theme_minimal() +
+    theme(
+        axis.text.x = element_text(angle = 30, hjust = 1),
+        panel.grid = element_blank(),
+        plot.title = element_text(face = "bold"),
+        legend.position = "right"
     )
