@@ -1,0 +1,1017 @@
+---
+title: "Obesity and Healthcare Spending Among Medicare Beneficiaries"
+subtitle: "MEPS 2020 & 2022 | Naive GLM vs. Instrumental Variable Analysis"
+date: today
+format:
+  pdf:
+    toc: true
+    toc-depth: 3
+    fig-width: 7
+    fig-height: 4.5
+    df-print: kable
+    geometry: margin=1in
+    fontsize: 11pt
+    include-in-header:
+      text: |
+        \usepackage{booktabs}
+        \usepackage{longtable}
+execute:
+  warning: false
+  message: false
+  cache: true
+---
+
+```{r setup}
+#| cache: false
+library(tidyverse)
+library(tidymodels)
+library(ggthemes)
+library(skimr)
+library(srvyr)
+library(gtsummary)
+library(scales)
+
+source("functions.R")
+
+wsj_navy <- "#0F3F6D"
+wsj_red  <- "#C41E3D"
+```
+
+---
+
+## Overview
+
+This report analyzes the relationship between obesity and healthcare spending among Medicare
+beneficiaries using the Medical Expenditure Panel Survey (MEPS). Two distinct analytical
+approaches are compared:
+
+1. **My Analysis** — A survey-weighted Gamma GLM using categorical BMI class as the primary
+   predictor, estimating spending differences across BMI groups and projecting savings from
+   stepping beneficiaries down one obesity class.
+
+2. **Article Replication** — A 2-Stage Residual Inclusion (2SRI) instrumental variable model
+   following Cawley et al., using the BMI of the oldest household child as an instrument for
+   the parent's BMI to address endogeneity. Savings are projected at 5–25% continuous BMI
+   reductions.
+
+---
+
+## Data
+
+### Source
+
+Data come from the **Medical Expenditure Panel Survey Household Component (MEPS-HC)**, a
+nationally representative survey of the US civilian non-institutionalized population. MEPS
+collects longitudinal data on health conditions, medical expenditures, and health insurance.
+
+**Survey years used: 2020 and 2022.** BMI (ADBMI42) is collected only in even-numbered survey
+years (from 2018 onward), limiting the pooled sample to these two rounds.
+
+**Files used:**
+
+| File | Year | Description |
+|------|------|-------------|
+| h222 / h241 | 2020 / 2022 | Conditions files — CCSR-coded diagnoses |
+| h224 / h243 | 2020 / 2022 | Consolidated person-level files — demographics, expenditures, weights |
+
+### Target Conditions
+
+The analysis focuses on Medicare beneficiaries with at least one of **10 target clinical
+conditions** identified via CCSR codes:
+
+- Diabetes, Hyperlipidemia, Hypertension
+- Mental health conditions, Pulmonary disease, Asthma
+- Arthritis, Back problems, Heart disease, Cerebrovascular disease
+
+---
+
+## Data Pipeline
+
+### Conditions Data
+
+```{r load-conditions}
+#| cache: true
+target_ccsr <- c(
+    "END002","END003","END004","END005","END006",
+    "END010",
+    "CIR007","CIR008",
+    "MBD001","MBD002","MBD003","MBD004","MBD005","MBD006","MBD007","MBD008",
+    "MBD009","MBD010","MBD011","MBD012","MBD013","MBD014","MBD017","MBD018",
+    "MBD019","MBD020","MBD021","MBD022","MBD023","MBD024","MBD025","MBD026",
+    "MBD027","MBD028","MBD029","MBD030","MBD031","MBD032","MBD033","MBD034",
+    "RSP006","RSP007","RSP008","RSP010","RSP011","RSP012","RSP013","RSP014","RSP016",
+    "MUS001","MUS002","MUS003","MUS004","MUS005","MUS006","MUS007",
+    "MUS011","MUS038",
+    "CIR001","CIR002","CIR003","CIR004","CIR005","CIR006","CIR010","CIR011",
+    "CIR012","CIR014","CIR015","CIR016","CIR017","CIR018",
+    "NVS012","CIR020","CIR021","CIR022","CIR023","CIR024","CIR025",
+    "RSP009"
+)
+
+h222 <- load_meps_conditions(
+    dat_path    = "data/conditions_data/2020/h222.dat",
+    spec_path   = "setup/h222_spec.csv",
+    rename_path = "setup/h222_renames.csv",
+    target_ccsr = target_ccsr,
+    ccsr_cols   = c("ccsr_code1","ccsr_code2","ccsr_code3"),
+    survey_year = 2020
+)
+
+h241 <- load_meps_conditions(
+    dat_path    = "data/conditions_data/2022/h241.dat",
+    spec_path   = "setup/h241_spec.csv",
+    rename_path = "setup/h241_renames.csv",
+    target_ccsr = target_ccsr,
+    ccsr_cols   = c("ccsr_code1","ccsr_code2","ccsr_code3","ccsr_code4"),
+    survey_year = 2022
+)
+
+conditions_stacked <- bind_rows(h222, h241)
+rm(h222, h241); gc()
+```
+
+### Consolidated Data
+
+```{r load-consolidated}
+#| cache: true
+consolidated_cols_shared <- c(
+    panel_number = "panel_number",
+    family_id    = "annual_family_identifier",
+    sex          = "sex",
+    race         = "race_edited_imputed_racev1x",
+    hispanic     = "hispanic_ethnicity_edited_imputed_hispanx",
+    education    = "years_of_educ_when_first_entered_meps",
+    bmi          = "adult_body_mass_index_17_rd_4_2",
+    child_bmi    = "child_s_body_mass_index_6_17_r4_2"
+)
+
+consolidated_cols_2020 <- c(
+    person_id        = "person_id_duid_pid",
+    consolidated_cols_shared,
+    age              = "age_as_of_12_31_20_edited_imputed",
+    region           = "census_region_as_of_12_31_20",
+    marital_status   = "marital_status_12_31_20_edited_imputed",
+    ever_medicare    = "ever_have_medicare_during_2020_ed",
+    mcr_jan          = "covered_by_medicare_in_jan20_ed",
+    mcr_feb          = "covered_by_medicare_in_feb20_ed",
+    mcr_mar          = "covered_by_medicare_in_mar20_ed",
+    mcr_apr          = "covered_by_medicare_in_apr20_ed",
+    mcr_may          = "covered_by_medicare_in_may20_ed",
+    mcr_jun          = "covered_by_medicare_in_jun20_ed",
+    mcr_jul          = "covered_by_medicare_in_jul20_ed",
+    mcr_aug          = "covered_by_medicare_in_aug20_ed",
+    mcr_sep          = "covered_by_medicare_in_sep20_ed",
+    mcr_oct          = "covered_by_medicare_in_oct20_ed",
+    mcr_nov          = "covered_by_medicare_in_nov20_ed",
+    mcr_dec          = "covered_by_medicare_in_dec20_ed",
+    total_expenditure = "total_health_care_exp_20",
+    person_weight    = "final_person_weight_2020",
+    saq_weight       = "final_saq_person_weight_2020",
+    variance_stratum = "variance_estimation_stratum_2020",
+    variance_psu     = "variance_estimation_psu_2020"
+)
+
+consolidated_cols_2022 <- c(
+    person_id        = "person_id_duid_pid",
+    consolidated_cols_shared,
+    age              = "age_as_of_12_31_22_edited_imputed",
+    region           = "census_region_as_of_12_31_22",
+    marital_status   = "marital_status_12_31_22_edited_imputed",
+    ever_medicare    = "ever_have_medicare_during_2022_ed",
+    mcr_jan          = "covered_by_medicare_in_jan22_ed",
+    mcr_feb          = "covered_by_medicare_in_feb22_ed",
+    mcr_mar          = "covered_by_medicare_in_mar22_ed",
+    mcr_apr          = "covered_by_medicare_in_apr22_ed",
+    mcr_may          = "covered_by_medicare_in_may22_ed",
+    mcr_jun          = "covered_by_medicare_in_jun22_ed",
+    mcr_jul          = "covered_by_medicare_in_jul22_ed",
+    mcr_aug          = "covered_by_medicare_in_aug22_ed",
+    mcr_sep          = "covered_by_medicare_in_sep22_ed",
+    mcr_oct          = "covered_by_medicare_in_oct22_ed",
+    mcr_nov          = "covered_by_medicare_in_nov22_ed",
+    mcr_dec          = "covered_by_medicare_in_dec22_ed",
+    total_expenditure = "total_health_care_exp_22",
+    person_weight    = "final_person_weight_2022",
+    saq_weight       = "final_saq_person_weight_2022",
+    variance_stratum = "variance_estimation_stratum_2022",
+    variance_psu     = "variance_estimation_psu_2022"
+)
+
+h224 <- load_meps_consolidated(
+    dat_path    = "data/consolidated_data/2020/H224.DAT",
+    spec_path   = "setup/h224_spec.csv",
+    rename_path = "setup/h224_renames.csv",
+    survey_year = 2020,
+    col_map     = consolidated_cols_2020
+)
+
+h243 <- load_meps_consolidated(
+    dat_path    = "data/consolidated_data/2022/h243.dat",
+    spec_path   = "setup/h243_spec.csv",
+    rename_path = "setup/h243_renames.csv",
+    survey_year = 2022,
+    col_map     = consolidated_cols_2022
+)
+
+consolidated_stacked <- bind_rows(h224, h243)
+rm(h224, h243); gc()
+```
+
+### Sample Construction & Cleaning
+
+```{r build-data-clean}
+#| cache: true
+ccsr_to_condition <- c(
+    END002="diabetes", END003="diabetes", END004="diabetes", END005="diabetes", END006="diabetes",
+    END010="hyperlipidemia",
+    CIR007="hypertension", CIR008="hypertension",
+    MBD001="mental_health", MBD002="mental_health", MBD003="mental_health", MBD004="mental_health",
+    MBD005="mental_health", MBD006="mental_health", MBD007="mental_health", MBD008="mental_health",
+    MBD009="mental_health", MBD010="mental_health", MBD011="mental_health", MBD012="mental_health",
+    MBD013="mental_health", MBD014="mental_health", MBD017="mental_health", MBD018="mental_health",
+    MBD019="mental_health", MBD020="mental_health", MBD021="mental_health", MBD022="mental_health",
+    MBD023="mental_health", MBD024="mental_health", MBD025="mental_health", MBD026="mental_health",
+    MBD027="mental_health", MBD028="mental_health", MBD029="mental_health", MBD030="mental_health",
+    MBD031="mental_health", MBD032="mental_health", MBD033="mental_health", MBD034="mental_health",
+    RSP006="pulmonary_disease", RSP007="pulmonary_disease", RSP008="pulmonary_disease",
+    RSP010="pulmonary_disease", RSP011="pulmonary_disease", RSP012="pulmonary_disease",
+    RSP013="pulmonary_disease", RSP014="pulmonary_disease", RSP016="pulmonary_disease",
+    MUS001="arthritis", MUS002="arthritis", MUS003="arthritis", MUS004="arthritis",
+    MUS005="arthritis", MUS006="arthritis", MUS007="arthritis",
+    MUS011="back_problems", MUS038="back_problems",
+    CIR001="heart_disease", CIR002="heart_disease", CIR003="heart_disease", CIR004="heart_disease",
+    CIR005="heart_disease", CIR006="heart_disease", CIR010="heart_disease", CIR011="heart_disease",
+    CIR012="heart_disease", CIR014="heart_disease", CIR015="heart_disease", CIR016="heart_disease",
+    CIR017="heart_disease", CIR018="heart_disease",
+    NVS012="cerebrovascular_disease", CIR020="cerebrovascular_disease",
+    CIR021="cerebrovascular_disease", CIR022="cerebrovascular_disease",
+    CIR023="cerebrovascular_disease", CIR024="cerebrovascular_disease",
+    CIR025="cerebrovascular_disease",
+    RSP009="asthma"
+)
+
+mcr_months <- paste0("mcr_", c("jan","feb","mar","apr","may","jun",
+                                "jul","aug","sep","oct","nov","dec"))
+
+condition_vars <- c("diabetes","hypertension","hyperlipidemia","mental_health",
+                    "pulmonary_disease","arthritis","back_problems","heart_disease",
+                    "cerebrovascular_disease","asthma")
+
+data_joined <- consolidated_stacked |>
+    inner_join(conditions_stacked, by = c("person_id","panel_number","survey_year")) |>
+    mutate(across(starts_with("ccsr_code"), ~ ccsr_to_condition[.]))
+
+data_medicare <- data_joined |>
+    filter(if_all(all_of(mcr_months), ~ . == 1))
+
+person_cols <- c("person_id","panel_number","family_id","sex","race","hispanic",
+                 "education","bmi","age","region","marital_status","ever_medicare",
+                 mcr_months,"total_expenditure","person_weight","saq_weight",
+                 "variance_stratum","variance_psu","survey_year")
+
+condition_flags <- data_medicare |>
+    select(person_id, survey_year, starts_with("ccsr_code")) |>
+    pivot_longer(starts_with("ccsr_code"), values_to = "condition", names_to = NULL) |>
+    filter(!is.na(condition)) |>
+    distinct() |>
+    mutate(present = 1L) |>
+    pivot_wider(names_from = condition, values_from = present, values_fill = 0L)
+
+data_clean <- data_medicare |>
+    select(all_of(person_cols)) |>
+    distinct(person_id, survey_year, .keep_all = TRUE) |>
+    filter(!is.na(bmi), between(bmi, 10, 100)) |>
+    filter(!is.na(total_expenditure), total_expenditure > 0) |>
+    filter(!is.na(person_weight), person_weight > 0) |>
+    filter(!is.na(sex), !is.na(race), !is.na(hispanic),
+           !is.na(education), !is.na(marital_status), !is.na(region)) |>
+    select(-all_of(mcr_months), -ever_medicare) |>
+    inner_join(condition_flags, by = c("person_id","survey_year")) |>
+    mutate(
+        bmi_category = factor(
+            case_when(
+                bmi < 25 ~ "normal_or_below",
+                bmi < 30 ~ "overweight",
+                bmi < 35 ~ "obese_class_i",
+                bmi < 40 ~ "obese_class_ii",
+                bmi >= 40 ~ "obese_class_iii"
+            ),
+            levels = c("normal_or_below","overweight","obese_class_i",
+                       "obese_class_ii","obese_class_iii")
+        )
+    ) |>
+    mutate(across(any_of(condition_vars), as.logical)) |>
+    mutate(
+        sex = factor(sex, levels = c(1,2), labels = c("Male","Female")),
+        race = factor(race, levels = 1:6,
+                      labels = c("White","Black","Am. Indian / Alaska Native",
+                                 "Asian","Nat. Hawaiian / Pacific Islander","Multiple races")),
+        hispanic = factor(hispanic, levels = c(1,2), labels = c("Hispanic","Not Hispanic")),
+        marital_status = factor(marital_status, levels = 1:5,
+                                labels = c("Married","Widowed","Divorced","Separated","Never married")),
+        region = factor(region, levels = 1:4,
+                        labels = c("Northeast","Midwest","South","West"))
+    )
+
+rm(data_joined, data_medicare, condition_flags, consolidated_stacked, conditions_stacked)
+invisible(gc())
+```
+
+The cleaning pipeline applies the following sequential filters:
+
+| Step | Filter | Rationale |
+|------|--------|-----------|
+| 1 | Inner join to conditions | Keep only persons with ≥ 1 target condition |
+| 2 | 12-month Medicare coverage | Continuous enrollment ensures complete spending capture |
+| 3 | Adult BMI 10–100 | Implausible values removed; children excluded |
+| 4 | Expenditure > 0 | Gamma family requires strictly positive outcomes |
+| 5 | Positive survey weight | Persons with missing/zero weights excluded |
+| 6 | Complete demographics | Listwise deletion on sex, race, Hispanic, education, marital status, region |
+| 7 | BMI categorization | Underweight collapsed into normal due to sparse counts in Medicare population |
+| 8 | Factor recoding | All categorical variables labeled for interpretable output |
+
+```{r sample-size}
+#| echo: false
+cat("Final analytic sample:", nrow(data_clean), "person-years\n")
+cat("  2020:", sum(data_clean$survey_year == 2020), "\n")
+cat("  2022:", sum(data_clean$survey_year == 2022), "\n")
+```
+
+### Survey Design
+
+All estimates account for MEPS's stratified clustered design.
+
+```{r survey-design}
+svy_clean <- data_clean |>
+    as_survey_design(
+        ids     = variance_psu,
+        strata  = variance_stratum,
+        weights = person_weight,
+        nest    = TRUE
+    )
+```
+
+---
+
+## Descriptive Statistics
+
+### Table 1: Sample Characteristics by BMI Category
+
+```{r table1}
+#| cache: true
+tbl_svysummary(
+    svy_clean,
+    by      = bmi_category,
+    include = c(age, sex, race, hispanic, education, marital_status, region,
+                total_expenditure, all_of(condition_vars)),
+    statistic = list(all_continuous() ~ "{mean} ({sd})",
+                     all_categorical() ~ "{p}% ({n})"),
+    digits    = list(all_continuous() ~ 1, all_categorical() ~ c(1, 0)),
+    missing   = "no",
+    label     = list(
+        age ~ "Age (years)", sex ~ "Sex", race ~ "Race",
+        hispanic ~ "Hispanic ethnicity", education ~ "Education (years)",
+        marital_status ~ "Marital status", region ~ "Census region",
+        total_expenditure ~ "Total expenditure ($)",
+        diabetes ~ "Diabetes", hypertension ~ "Hypertension",
+        hyperlipidemia ~ "Hyperlipidemia",
+        mental_health ~ "Mental health condition",
+        pulmonary_disease ~ "Pulmonary disease", arthritis ~ "Arthritis",
+        back_problems ~ "Back problems", heart_disease ~ "Heart disease",
+        cerebrovascular_disease ~ "Cerebrovascular disease", asthma ~ "Asthma"
+    )
+) |>
+    add_p(test = list(all_continuous() ~ "svy.kruskal.test",
+                      all_categorical() ~ "svy.chisq.test")) |>
+    add_overall() |>
+    bold_labels() |>
+    bold_p(t = 0.05)
+```
+
+### Condition Prevalence Heatmap
+
+```{r heatmap}
+#| fig-height: 6
+heatmap_data <- condition_vars |>
+    map(\(cond) {
+        svy_clean |>
+            group_by(bmi_category) |>
+            summarise(prevalence = survey_mean(as.numeric(.data[[cond]]),
+                                               na.rm = TRUE) * 100) |>
+            mutate(condition = cond)
+    }) |>
+    list_rbind() |>
+    mutate(condition = str_replace_all(condition, "_", " ") |> str_to_title())
+
+bmi_labels <- c(normal_or_below = "Normal/Below", overweight = "Overweight",
+                obese_class_i = "Obese I", obese_class_ii = "Obese II",
+                obese_class_iii = "Obese III")
+
+ggplot(heatmap_data, aes(x = bmi_category, y = condition, fill = prevalence)) +
+    geom_tile(color = "white", linewidth = 0.5) +
+    geom_text(aes(label = sprintf("%.1f%%", prevalence)), size = 3, color = "black") +
+    scale_fill_gradient(low = "#f7fbff", high = "#2166ac", name = "Prevalence (%)") +
+    scale_x_discrete(labels = bmi_labels) +
+    labs(title = "Condition Prevalence by BMI Category",
+         subtitle = "Medicare beneficiaries, 2020 & 2022 | Survey-weighted estimates",
+         x = NULL, y = NULL) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 25, hjust = 1),
+          panel.grid = element_blank(),
+          plot.title = element_text(face = "bold"))
+```
+
+---
+
+## My Analysis: Naive Gamma GLM
+
+### Approach
+
+This analysis treats BMI class as an observed categorical predictor and estimates its
+association with total healthcare expenditure using a **survey-weighted Gamma GLM with a
+log link** — the standard family for non-negative, right-skewed cost data. BMI category
+is the primary predictor; covariates include age, sex, race, Hispanic ethnicity, education,
+marital status, region, survey year, and all 10 condition flags.
+
+Spending differences are summarized as **exponentiated coefficients (spending ratios)**
+relative to the Normal/Underweight reference group. Savings are then projected by
+counterfactually assigning each obese person to the next lower BMI class, holding all
+other covariates fixed.
+
+### Spending Gradient
+
+```{r spending-gradient}
+spend_by_bmi <- svy_clean |>
+    group_by(bmi_category) |>
+    summarise(mean = survey_mean(total_expenditure, vartype = "ci", na.rm = TRUE))
+
+ggplot(spend_by_bmi, aes(x = bmi_category, y = mean)) +
+    geom_col(fill = wsj_navy, width = 0.65) +
+    geom_errorbar(aes(ymin = mean_low, ymax = mean_upp),
+                  width = 0.2, linewidth = 0.7, color = "gray40") +
+    geom_text(aes(label = dollar(round(mean, -2))),
+              vjust = -0.9, size = 3.5, fontface = "bold") +
+    scale_x_discrete(labels = c(normal_or_below = "Normal /\nBelow",
+                                 overweight = "Overweight",
+                                 obese_class_i = "Obese\nClass I",
+                                 obese_class_ii = "Obese\nClass II",
+                                 obese_class_iii = "Obese\nClass III")) +
+    scale_y_continuous(labels = dollar_format(), expand = expansion(mult = c(0, 0.18))) +
+    labs(title = "Healthcare Spending Rises With Obesity",
+         subtitle = "Survey-weighted mean annual expenditure | Medicare, 2020 & 2022",
+         x = NULL, y = "Mean annual expenditure") +
+    theme_wsj(base_size = 11) +
+    theme(axis.title.y = element_text(size = 9),
+          plot.subtitle = element_text(size = 9, color = "gray40"))
+```
+
+### Adjusted Spending Ratios
+
+```{r model-spend}
+#| cache: true
+model_spend <- survey::svyglm(
+    total_expenditure ~ bmi_category + age + sex + race + hispanic +
+        education + marital_status + region + as.factor(survey_year) +
+        diabetes + hypertension + hyperlipidemia + mental_health +
+        pulmonary_disease + arthritis + back_problems + heart_disease +
+        cerebrovascular_disease + asthma,
+    design = svy_clean,
+    family = Gamma(link = "log")
+)
+```
+
+```{r plot-spend-coefs}
+bmi_coefs <- tibble(
+    term      = names(coef(model_spend)),
+    estimate  = coef(model_spend),
+    conf.low  = confint(model_spend)[, 1],
+    conf.high = confint(model_spend)[, 2]
+) |>
+    filter(str_detect(term, "bmi_category")) |>
+    mutate(
+        across(c(estimate, conf.low, conf.high), exp),
+        label = str_remove(term, "bmi_category") |>
+            str_replace_all("_", " ") |> str_to_title()
+    )
+
+ggplot(bmi_coefs, aes(x = estimate, y = fct_reorder(label, estimate))) +
+    geom_vline(xintercept = 1, linetype = "dashed", color = "gray50", linewidth = 0.7) +
+    geom_errorbarh(aes(xmin = conf.low, xmax = conf.high),
+                   height = 0.2, linewidth = 0.8, color = "gray40") +
+    geom_point(size = 4, color = wsj_red) +
+    geom_text(aes(label = sprintf("×%.2f", estimate)),
+              hjust = -0.35, size = 3.5, fontface = "bold") +
+    scale_x_continuous(limits = c(0.9, max(bmi_coefs$conf.high) * 1.18),
+                       labels = \(x) sprintf("×%.1f", x)) +
+    labs(title = "Obesity Linked to Higher Spending After Adjustment",
+         subtitle = "Spending ratio vs. Normal/Underweight | Gamma GLM, survey-weighted",
+         x = "Adjusted spending ratio (reference: Normal / Underweight)", y = NULL) +
+    theme_wsj(base_size = 11) +
+    theme(axis.title.x = element_text(size = 9),
+          plot.subtitle = element_text(size = 9, color = "gray40"))
+```
+
+### Counterfactual Savings Projection
+
+Each obese beneficiary is counterfactually assigned to the next lower BMI category
+(Class III → II, Class II → I, Class I → Overweight), with all other covariates held
+fixed. The predicted spending difference is the estimated per-person annual saving.
+
+```{r counterfactual}
+#| cache: true
+bmi_levels <- levels(data_clean$bmi_category)
+
+data_cf <- data_clean |>
+    mutate(bmi_category = factor(
+        case_when(
+            bmi_category == "obese_class_iii" ~ "obese_class_ii",
+            bmi_category == "obese_class_ii"  ~ "obese_class_i",
+            bmi_category == "obese_class_i"   ~ "overweight",
+            TRUE ~ as.character(bmi_category)
+        ), levels = bmi_levels
+    ))
+
+pred_orig <- as.numeric(predict(model_spend, newdata = data_clean, type = "response"))
+pred_cf   <- as.numeric(predict(model_spend, newdata = data_cf,    type = "response"))
+
+savings_data <- data_clean |>
+    mutate(spend_pred = pred_orig, spend_cf = pred_cf,
+           spend_saving = spend_pred - spend_cf) |>
+    filter(bmi_category %in% c("obese_class_i","obese_class_ii","obese_class_iii")) |>
+    group_by(bmi_category) |>
+    summarise(mean_saving_pp = weighted.mean(spend_saving, w = person_weight),
+              total_saving   = sum(spend_saving * person_weight),
+              .groups = "drop")
+
+savings_labels <- c(obese_class_i   = "Obese Class I\n→ Overweight",
+                    obese_class_ii  = "Obese Class II\n→ Class I",
+                    obese_class_iii = "Obese Class III\n→ Class II")
+```
+
+```{r plot-savings-naive}
+#| layout-ncol: 2
+ggplot(savings_data, aes(x = bmi_category, y = mean_saving_pp)) +
+    geom_col(fill = wsj_red, width = 0.6) +
+    geom_text(aes(label = dollar(round(mean_saving_pp, -1))),
+              vjust = -0.6, size = 4, fontface = "bold") +
+    scale_x_discrete(labels = savings_labels) +
+    scale_y_continuous(labels = dollar_format(), expand = expansion(mult = c(0, 0.2))) +
+    labs(title = "Predicted Annual Savings Per Person",
+         subtitle = "One BMI class reduction | Naive GLM",
+         x = NULL, y = "Mean savings per person") +
+    theme_wsj(base_size = 11) +
+    theme(axis.title.y = element_text(size = 9),
+          plot.subtitle = element_text(size = 9, color = "gray40"))
+
+ggplot(savings_data, aes(x = bmi_category, y = total_saving / 1e9)) +
+    geom_col(fill = wsj_navy, width = 0.6) +
+    geom_text(aes(label = sprintf("$%.1fB", total_saving / 1e9)),
+              vjust = -0.6, size = 4, fontface = "bold") +
+    scale_x_discrete(labels = savings_labels) +
+    scale_y_continuous(labels = \(x) sprintf("$%.0fB", x),
+                       expand = expansion(mult = c(0, 0.2))) +
+    labs(title = "Estimated Total Medicare Savings",
+         subtitle = "Population-weighted | Naive GLM",
+         x = NULL, y = "Total savings (billions)") +
+    theme_wsj(base_size = 11) +
+    theme(axis.title.y = element_text(size = 9),
+          plot.subtitle = element_text(size = 9, color = "gray40"))
+```
+
+---
+
+## Article Replication: 2SRI Instrumental Variable Model
+
+### Approach
+
+This replication follows Cawley et al. and addresses a fundamental limitation of the
+naive model: **BMI is endogenous**. Unobserved factors (genetics, lifestyle, socioeconomic
+circumstances) simultaneously influence both BMI and healthcare utilization, meaning the
+naive GLM coefficient on BMI conflates the causal effect of adiposity with these
+confounders.
+
+The solution is a **2-Stage Residual Inclusion (2SRI)** instrumental variable estimator:
+
+- **Stage 1:** Regress BMI on the instrument and all covariates. The instrument is the
+  BMI of the oldest household child aged 11–45, identified through MEPS family linkages.
+  Child BMI is a strong predictor of parent BMI — up to 75% of variation in weight is
+  genetic — but is plausibly unrelated to the parent's medical spending after conditioning
+  on estimated BMI and covariates.
+
+- **Stage 2:** Estimate the Gamma GLM for expenditures including both BMI and the
+  Stage 1 residuals. The residual term absorbs the endogenous component of BMI
+  (Terza et al. 2008), producing a consistent IV estimate.
+
+### Instrument Construction
+
+```{r build-family-data}
+#| cache: true
+family_cols_2020 <- c(
+    person_id = "person_id_duid_pid", family_id = "annual_family_identifier",
+    panel_number = "panel_number", age = "age_as_of_12_31_20_edited_imputed",
+    bmi_adult = "adult_body_mass_index_17_rd_4_2",
+    bmi_child = "child_s_body_mass_index_6_17_r4_2",
+    family_size = "ru_size_including_student_as_of_12_31_20",
+    proxy = "was_respondent_a_proxy_in_r4_2",
+    dobmm = "date_of_birth_month", dobyy = "date_of_birth_year"
+)
+family_cols_2022 <- c(
+    person_id = "person_id_duid_pid", family_id = "annual_family_identifier",
+    panel_number = "panel_number", age = "age_as_of_12_31_22_edited_imputed",
+    bmi_adult = "adult_body_mass_index_17_rd_4_2",
+    bmi_child = "child_s_body_mass_index_6_17_r4_2",
+    family_size = "ru_size_including_student_as_of_12_31_22",
+    proxy = "was_respondent_a_proxy_in_r4_2",
+    dobmm = "date_of_birth_month", dobyy = "date_of_birth_year"
+)
+
+family_all <- bind_rows(
+    load_meps_consolidated("data/consolidated_data/2020/H224.DAT",
+                           "setup/h224_spec.csv", "setup/h224_renames.csv",
+                           2020, family_cols_2020),
+    load_meps_consolidated("data/consolidated_data/2022/h243.dat",
+                           "setup/h243_spec.csv", "setup/h243_renames.csv",
+                           2022, family_cols_2022)
+)
+
+instrument_candidates <- family_all |>
+    mutate(
+        bmi_combined = case_when(
+            age >= 11 & age <= 17 & !is.na(bmi_child) ~ bmi_child,
+            age >= 18 & age <= 45 & !is.na(bmi_adult) ~ bmi_adult,
+            TRUE ~ NA_real_
+        ),
+        child_age_months = (survey_year - dobyy) * 12 - (dobmm - 12)
+    ) |>
+    filter(!is.na(bmi_combined), age >= 11, age <= 45, !is.na(child_age_months)) |>
+    select(family_id, panel_number, survey_year,
+           child_person_id = person_id, child_bmi_instrument = bmi_combined,
+           child_age_months, child_age = age)
+
+instrument_table <- data_clean |>
+    select(person_id, family_id, panel_number, survey_year) |>
+    inner_join(instrument_candidates, by = c("family_id","panel_number","survey_year")) |>
+    filter(person_id != child_person_id) |>
+    group_by(person_id, survey_year) |>
+    slice_max(child_age, n = 1, with_ties = FALSE) |>
+    ungroup() |>
+    select(person_id, survey_year, child_bmi_instrument, child_age_months)
+
+parent_extra <- family_all |>
+    semi_join(data_clean, by = c("person_id","survey_year")) |>
+    select(person_id, survey_year, family_size, proxy)
+
+rm(family_all); gc()
+
+data_iv <- data_clean |>
+    inner_join(instrument_table, by = c("person_id","survey_year")) |>
+    left_join(parent_extra,      by = c("person_id","survey_year")) |>
+    filter(!is.na(family_size), !is.na(proxy)) |>
+    mutate(
+        race_eth = factor(
+            case_when(
+                hispanic == "Hispanic"                       ~ "Hispanic",
+                race == "White" & hispanic == "Not Hispanic" ~ "Non-Hispanic White",
+                race == "Black" & hispanic == "Not Hispanic" ~ "Non-Hispanic Black",
+                race == "Asian"                              ~ "Asian",
+                TRUE                                         ~ "Other"
+            ),
+            levels = c("Non-Hispanic White","Non-Hispanic Black","Hispanic","Asian","Other")
+        ),
+        age_group = cut(age, breaks = c(0,64,69,74,79,84,Inf),
+                        labels = c("<65","65-69","70-74","75-79","80-84","85+"),
+                        right = TRUE),
+        proxy_reported = factor(proxy, levels = c(1,2), labels = c("Proxy","Self"))
+    )
+```
+
+```{r iv-sample-size}
+#| echo: false
+cat("IV analytic sample:", nrow(data_iv), "person-years\n")
+cat("  (", round(nrow(data_iv)/nrow(data_clean)*100, 1),
+    "% of data_clean — adults with qualifying household child)\n")
+```
+
+The IV sample is a subset of the main analytic sample, restricted to Medicare
+beneficiaries who have a household child aged 11–45 with a valid BMI recorded in the
+same survey year. This sample reduction is expected and is acknowledged as a limitation.
+
+### Instrument Strength
+
+```{r instrument-scatter}
+ggplot(data_iv |> slice_sample(n = min(3000, nrow(data_iv))),
+       aes(x = child_bmi_instrument, y = bmi)) +
+    geom_jitter(alpha = 0.25, size = 0.9, color = wsj_navy, width = 0.3, height = 0.3) +
+    geom_smooth(method = "lm", color = wsj_red, linewidth = 1.2, se = TRUE) +
+    labs(title = "Child BMI Predicts Parent BMI",
+         subtitle = "Instrument validity check | Medicare adults with household child",
+         x = "Oldest child BMI (instrument)", y = "Parent BMI") +
+    theme_wsj(base_size = 11) +
+    theme(axis.title = element_text(size = 9),
+          plot.subtitle = element_text(size = 9, color = "gray40"))
+```
+
+### Stage 1: First-Stage Regression
+
+```{r stage1}
+#| cache: true
+svy_iv <- data_iv |>
+    as_survey_design(ids = variance_psu, strata = variance_stratum,
+                     weights = person_weight, nest = TRUE)
+
+stage1_model <- survey::svyglm(
+    bmi ~ child_bmi_instrument + age_group + sex + race_eth + education +
+        marital_status + region + family_size + proxy_reported +
+        child_age_months + as.factor(survey_year),
+    design = svy_iv, family = gaussian()
+)
+
+stage1_ftest <- survey::regTermTest(stage1_model, ~ child_bmi_instrument)
+```
+
+```{r stage1-plot}
+stage1_coef <- tibble(
+    term      = names(coef(stage1_model)),
+    estimate  = coef(stage1_model),
+    conf.low  = confint(stage1_model)[, 1],
+    conf.high = confint(stage1_model)[, 2]
+) |> filter(term == "child_bmi_instrument")
+
+ggplot(stage1_coef, aes(x = estimate, y = "Child BMI -> Parent BMI")) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray50", linewidth = 0.7) +
+    geom_errorbarh(aes(xmin = conf.low, xmax = conf.high),
+                   height = 0.15, linewidth = 1, color = "gray40") +
+    geom_point(size = 5, color = wsj_red) +
+    geom_text(aes(label = sprintf("beta = %.3f", estimate)),
+              vjust = -1.3, size = 3.5, fontface = "bold") +
+    annotate("text", x = stage1_coef$conf.high * 1.05, y = 1,
+             label = sprintf("F = %.1f", as.numeric(stage1_ftest$Ftest)),
+             size = 3.5, color = wsj_navy, fontface = "bold", hjust = 0) +
+    labs(title = "Stage 1: Child BMI Is a Strong Instrument",
+         subtitle = "Unit increase in child BMI predicts unit increase in parent BMI",
+         x = "Stage 1 coefficient", y = NULL) +
+    theme_wsj(base_size = 11) +
+    theme(axis.title.x = element_text(size = 9),
+          plot.subtitle = element_text(size = 9, color = "gray40"))
+```
+
+The F-statistic on the excluded instrument is
+`r sprintf("%.1f", as.numeric(stage1_ftest$Ftest))`,
+`r if(as.numeric(stage1_ftest$Ftest) > 10) "exceeding" else "below"` the conventional
+threshold of 10 for a strong instrument.
+
+### Stage 2: IV-Adjusted Spending Model
+
+```{r stage2}
+#| cache: true
+data_iv <- data_iv |>
+    mutate(resid_stage1 = residuals(stage1_model))
+
+svy_iv <- data_iv |>
+    as_survey_design(ids = variance_psu, strata = variance_stratum,
+                     weights = person_weight, nest = TRUE)
+
+model_2sri <- survey::svyglm(
+    total_expenditure ~ bmi + resid_stage1 +
+        age_group + sex + race_eth + education + marital_status + region +
+        family_size + proxy_reported + child_age_months + as.factor(survey_year) +
+        diabetes + hypertension + hyperlipidemia + mental_health +
+        pulmonary_disease + arthritis + back_problems + heart_disease +
+        cerebrovascular_disease + asthma,
+    design = svy_iv, family = Gamma(link = "log")
+)
+```
+
+```{r stage2-bmi-coef}
+iv_bmi_coef <- tibble(
+    term = names(coef(model_2sri)), estimate = coef(model_2sri),
+    conf.low = confint(model_2sri)[, 1], conf.high = confint(model_2sri)[, 2]
+) |>
+    filter(term == "bmi") |>
+    mutate(across(c(estimate, conf.low, conf.high), exp))
+
+ggplot(iv_bmi_coef, aes(x = estimate, y = "2SRI (IV-Adjusted)")) +
+    geom_vline(xintercept = 1, linetype = "dashed", color = "gray50", linewidth = 0.7) +
+    geom_errorbarh(aes(xmin = conf.low, xmax = conf.high),
+                   height = 0.15, linewidth = 1.1, color = "gray40") +
+    geom_point(size = 5, color = wsj_red) +
+    geom_text(aes(label = sprintf("x%.4f", estimate)),
+              vjust = -1.3, size = 3.5, fontface = "bold") +
+    labs(title = "2SRI: Spending Multiplier Per Unit BMI Increase",
+         subtitle = "Exponentiated continuous BMI coefficient | Gamma GLM, IV-adjusted",
+         x = "Spending ratio per unit BMI (reference = 1.0)", y = NULL) +
+    theme_wsj(base_size = 11) +
+    theme(axis.title.x = element_text(size = 9),
+          plot.subtitle = element_text(size = 9, color = "gray40"))
+```
+
+### BMI Reduction Simulation
+
+```{r simulation}
+#| cache: true
+bmi_pcts <- c(0.05, 0.10, 0.15, 0.20, 0.25)
+baseline_pred_iv <- as.numeric(predict(model_2sri, newdata = data_iv, type = "response"))
+
+sim_results <- map(bmi_pcts, \(pct) {
+    sim_pred <- as.numeric(predict(model_2sri,
+                                   newdata = data_iv |> mutate(bmi = bmi * (1 - pct)),
+                                   type = "response"))
+    tibble(
+        bmi_reduction_pct = pct * 100,
+        mean_saving_pp    = weighted.mean(baseline_pred_iv - sim_pred,
+                                          w = data_iv$person_weight),
+        total_saving_bil  = sum((baseline_pred_iv - sim_pred) *
+                                    data_iv$person_weight) / 1e9
+    )
+}) |> list_rbind()
+```
+
+```{r plot-sim}
+#| layout-ncol: 2
+ggplot(sim_results, aes(x = bmi_reduction_pct, y = mean_saving_pp)) +
+    geom_line(color = wsj_navy, linewidth = 1.2) +
+    geom_point(size = 4, color = wsj_red) +
+    geom_text(aes(label = dollar(round(mean_saving_pp, -1))),
+              vjust = -0.9, size = 3.5, fontface = "bold") +
+    scale_x_continuous(breaks = bmi_pcts * 100, labels = \(x) paste0(x, "%")) +
+    scale_y_continuous(labels = dollar_format(), expand = expansion(mult = c(0.05, 0.2))) +
+    labs(title = "Greater BMI Reduction Yields Greater Savings",
+         subtitle = "Per-person annual savings | 2SRI IV model",
+         x = "BMI reduction", y = "Mean savings per person") +
+    theme_wsj(base_size = 11) +
+    theme(axis.title = element_text(size = 9),
+          plot.subtitle = element_text(size = 9, color = "gray40"))
+
+ggplot(sim_results, aes(x = factor(bmi_reduction_pct), y = total_saving_bil)) +
+    geom_col(fill = wsj_navy, width = 0.65) +
+    geom_text(aes(label = sprintf("$%.1fB", total_saving_bil)),
+              vjust = -0.6, size = 4, fontface = "bold") +
+    scale_x_discrete(labels = \(x) paste0(x, "%")) +
+    scale_y_continuous(labels = \(x) sprintf("$%.0fB", x),
+                       expand = expansion(mult = c(0, 0.2))) +
+    labs(title = "Estimated Total Medicare Savings",
+         subtitle = "Population-weighted | 2SRI IV model",
+         x = "BMI reduction", y = "Total savings (billions)") +
+    theme_wsj(base_size = 11) +
+    theme(axis.title = element_text(size = 9),
+          plot.subtitle = element_text(size = 9, color = "gray40"))
+```
+
+---
+
+## Comparison of Analyses
+
+### Side-by-Side Results
+
+```{r comparison-data}
+comparison_savings <- bind_rows(
+    savings_data |>
+        mutate(
+            method   = "My Analysis\n(Naive GLM)",
+            scenario = case_match(as.character(bmi_category),
+                "obese_class_i"   ~ "Class I\n-> Overweight",
+                "obese_class_ii"  ~ "Class II\n-> Class I",
+                "obese_class_iii" ~ "Class III\n-> Class II"),
+            savings_pp  = mean_saving_pp,
+            savings_tot = total_saving / 1e9
+        ) |> select(method, scenario, savings_pp, savings_tot),
+    sim_results |>
+        mutate(
+            method      = "2SRI Replication\n(IV-Adjusted)",
+            scenario    = paste0(bmi_reduction_pct, "%"),
+            savings_pp  = mean_saving_pp,
+            savings_tot = total_saving_bil
+        ) |> select(method, scenario, savings_pp, savings_tot)
+) |>
+    mutate(
+        method   = factor(method, levels = c("My Analysis\n(Naive GLM)",
+                                             "2SRI Replication\n(IV-Adjusted)")),
+        scenario = factor(scenario, levels = unique(scenario))
+    )
+```
+
+```{r comparison-plots}
+#| layout-ncol: 2
+ggplot(comparison_savings, aes(x = scenario, y = savings_pp, fill = method)) +
+    geom_col(width = 0.65, show.legend = FALSE) +
+    geom_text(aes(label = dollar(round(savings_pp, -1))),
+              vjust = -0.6, size = 3.2, fontface = "bold") +
+    scale_fill_manual(values = c("My Analysis\n(Naive GLM)" = wsj_navy,
+                                 "2SRI Replication\n(IV-Adjusted)" = wsj_red)) +
+    scale_y_continuous(labels = dollar_format(), expand = expansion(mult = c(0, 0.22))) +
+    facet_wrap(~ method, scales = "free_x", nrow = 1) +
+    labs(title = "Per-Person Savings: Two Methods",
+         x = NULL, y = "Mean annual savings per person") +
+    theme_wsj(base_size = 10) +
+    theme(axis.title.y = element_text(size = 9), strip.text = element_text(face = "bold"))
+
+ggplot(comparison_savings, aes(x = scenario, y = savings_tot, fill = method)) +
+    geom_col(width = 0.65, show.legend = FALSE) +
+    geom_text(aes(label = sprintf("$%.1fB", savings_tot)),
+              vjust = -0.6, size = 3.2, fontface = "bold") +
+    scale_fill_manual(values = c("My Analysis\n(Naive GLM)" = wsj_navy,
+                                 "2SRI Replication\n(IV-Adjusted)" = wsj_red)) +
+    scale_y_continuous(labels = \(x) sprintf("$%.0fB", x),
+                       expand = expansion(mult = c(0, 0.22))) +
+    facet_wrap(~ method, scales = "free_x", nrow = 1) +
+    labs(title = "Total Medicare Savings: Two Methods",
+         x = NULL, y = "Total annual savings (billions)") +
+    theme_wsj(base_size = 10) +
+    theme(axis.title.y = element_text(size = 9), strip.text = element_text(face = "bold"))
+```
+
+### Methodological Comparison
+
+```{r method-table}
+#| echo: false
+tibble(
+    Feature             = c("BMI parameterization", "Endogeneity treatment",
+                             "Sample", "Controls", "Savings scenario",
+                             "Key output"),
+    `My Analysis`       = c("Categorical (5 classes)", "None (observational)",
+                             "Full analytic sample", "Age, sex, race, ethnicity, education,\nmarital status, region, year, conditions",
+                             "One BMI class step-down per obese group",
+                             "Per-person & total savings by obesity class"),
+    `2SRI Replication`  = c("Continuous (unit BMI)", "2SRI with child BMI instrument",
+                             "Subset with household child aged 11-45",
+                             "As above plus family size, proxy status,\nchild age in months",
+                             "5 / 10 / 15 / 20 / 25% BMI reduction",
+                             "Per-person & total savings by % reduction")
+) |> knitr::kable()
+```
+
+### Discussion
+
+The two analyses answer related but distinct questions and should be interpreted accordingly.
+
+**My Analysis (Naive GLM)** estimates the *conditional association* between BMI class and
+annual healthcare spending among Medicare beneficiaries with at least one chronic condition.
+After adjusting for demographics and comorbidities, each successive obesity class is
+associated with meaningfully higher spending relative to the normal/underweight reference.
+The counterfactual projection — stepping every obese beneficiary down one BMI class — is an
+accounting exercise: it quantifies what aggregate spending *would have been* if spending
+patterns of lower-BMI beneficiaries applied to the current obese population. It is not a
+causal estimate.
+
+The naive approach overstates the causal effect of BMI reduction for two reasons. First,
+**unmeasured confounding**: individuals with higher BMI may differ from lower-BMI individuals
+in ways that independently drive spending — genetic predisposition, access to care, health
+behaviors — and the regression cannot fully account for these. Second, **reverse causality**
+is possible: poor health may cause both weight gain and high spending, making the observed
+association larger than the effect of weight change alone. As a result, naive GLM estimates
+should be regarded as an upper bound on the spending impact of obesity reduction programs.
+
+**The 2SRI Replication** addresses endogeneity by exploiting the genetic link between
+parent and child BMI. Because child BMI is determined largely by genetics inherited from the
+parent — not by the parent's healthcare utilization — it provides an exogenous shift in
+parental BMI. The IV estimate captures the *causal* spending effect of BMI, net of
+confounders. This is conceptually the right estimand for evaluating the financial impact of
+a weight-loss intervention: it reflects the spending change attributable specifically to a
+reduction in adiposity rather than to correlated health behaviors or unmeasured risk factors.
+
+**Comparing savings magnitudes** requires care because the two analyses use different units.
+The naive model projects savings from a *discrete class transition* (which implies different
+BMI reductions depending on where within a class a person sits), while the IV model projects
+savings from a *fixed percentage reduction* applied to continuous BMI. A rough comparison:
+the naive model's Class I → Overweight transition corresponds to a reduction of roughly
+5–15% of BMI for most Class I beneficiaries, and the per-person savings from the naive model
+for that group can be read against the IV model's 5–15% reduction estimates.
+
+Where the two methods agree, confidence in the finding is higher. Where they diverge, the
+IV estimate is the more defensible figure for policy purposes — particularly for programs
+that target BMI reduction through diet, exercise, or pharmacotherapy.
+
+**Limitations of the IV approach** are also worth noting. The instrument restricts the
+sample to the subset of Medicare beneficiaries with a household child aged 11–45, which
+is a selected group: older Medicare beneficiaries (85+) are unlikely to have children in
+that age range, and the instrument sample may skew toward younger or healthier enrollees.
+The IV estimate is therefore a Local Average Treatment Effect (LATE) — the effect for
+individuals whose BMI is influenced by the genetic endowment transmitted to their children,
+which may not generalize to the full Medicare population. Finally, the exclusion restriction
+— that child BMI affects parental spending only through parental BMI — could be violated if
+shared household health behaviors independently drive both child BMI and parental spending,
+though prior research has found limited evidence of such household effects on weight.
+
+---
+
+## Conclusions
+
+Both analyses consistently show that obesity is associated with substantially higher
+healthcare spending among Medicare beneficiaries, and that greater BMI reduction implies
+greater savings. Hypertension, diabetes, and heart disease show the strongest gradients
+across BMI categories in the descriptive data. The naive Gamma GLM provides an intuitive,
+accessible summary of the spending gradient and a clear upper-bound savings projection.
+The 2SRI IV replication provides a more causally defensible estimate, accounting for the
+endogeneity inherent in observational BMI data.
+
+For policy applications — such as estimating the Medicare savings from GLP-1 coverage or
+structured weight-loss programs — the IV-based estimates are preferred. For descriptive
+and planning purposes, the naive model's categorical framework may be more practical.
+Together, the two approaches bracket the likely range of savings attributable to obesity
+reduction in this population.
+
+---
+
+*Analysis conducted in R. Data: MEPS-HC 2020 & 2022 (AHRQ). Survey weights applied
+throughout via the `srvyr` package. All models account for MEPS stratified cluster
+sampling design.*
