@@ -847,6 +847,15 @@ h249 <- h249 |>
         ~ . %in% target_ccsr
     ))
 
+# Stack conditions files across all four survey years ------------------------
+
+h222 <- h222 |> mutate(survey_year = 2020L)
+h231 <- h231 |> mutate(survey_year = 2021L)
+h241 <- h241 |> mutate(survey_year = 2022L)
+h249 <- h249 |> mutate(survey_year = 2023L)
+
+conditions_stacked <- bind_rows(h222, h231, h241, h249)
+
 # Consolidated Data ------------------------------------------------------
 
 # %% 2020
@@ -29658,3 +29667,20 @@ h251 <- h251 |>
         variance_estimation_stratum_2023 = VARSTR,
         variance_estimation_psu_2023 = VARPSU
     )
+
+# Stack consolidated files across all four survey years ----------------------
+
+h224 <- h224 |> mutate(survey_year = 2020L)
+h233 <- h233 |> mutate(survey_year = 2021L)
+h243 <- h243 |> mutate(survey_year = 2022L)
+h251 <- h251 |> mutate(survey_year = 2023L)
+
+consolidated_stacked <- bind_rows(h224, h233, h243, h251)
+
+# Join consolidated and conditions into one analytic data frame --------------
+# inner_join keeps only persons who have at least one of the 10 target conditions
+# one row per condition per person per year (persons with multiple conditions
+# will appear on multiple rows)
+
+data_joined <- consolidated_stacked |>
+    inner_join(conditions_stacked, by = c("person_id", "survey_year"))
