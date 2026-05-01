@@ -1,19 +1,23 @@
-# Obesity.R
-# Replication of: "Health Care Spending Associated with Weight Loss"
 # Medicare population only | Survey years: 2020 & 2022
 # Note: MEPS BMI (ADBMI42) is only collected in even years (from 2018 onward)
+
+# %%
 
 library(tidyverse)
 library(tidymodels)
 library(ggthemes)
 library(skimr)
 library(srvyr)
+library(gtsummary)
 
 source("functions.R")
 
 # ---------------------------------------------------------------------------
 # CCSR codes for the 10 target clinical conditions
 # ---------------------------------------------------------------------------
+
+# %%
+
 target_ccsr <- c(
     # Diabetes
     "END002",
@@ -110,6 +114,9 @@ target_ccsr <- c(
 # ---------------------------------------------------------------------------
 # Conditions data  (2020 & 2022 only — BMI not collected in odd years)
 # ---------------------------------------------------------------------------
+
+# %%
+
 h222 <- load_meps_conditions(
     dat_path = "data/conditions_data/2020/h222.dat",
     spec_path = "setup/h222_spec.csv",
@@ -138,6 +145,9 @@ gc()
 # (age, region, marital status, Medicare coverage, expenditures, weights)
 # are overridden per year so both files stack with identical column names.
 # ---------------------------------------------------------------------------
+
+# %%
+
 consolidated_cols_shared <- c(
     panel_number = "panel_number",
     family_id = "annual_family_identifier",
@@ -204,6 +214,9 @@ consolidated_cols_2022 <- c(
 # ---------------------------------------------------------------------------
 # Consolidated data  (2020 & 2022 only)
 # ---------------------------------------------------------------------------
+
+# %%
+
 h224 <- load_meps_consolidated(
     dat_path = "data/consolidated_data/2020/h224.dat",
     spec_path = "setup/h224_spec.csv",
@@ -228,11 +241,322 @@ gc()
 # Join: keep only persons with at least one of the 10 target conditions
 # Result: one row per condition per person per year
 # ---------------------------------------------------------------------------
+
+# %%
+
 data_joined <- consolidated_stacked |>
     inner_join(
         conditions_stacked,
-        by = c("person_id", "survey_year")
+        by = c("person_id", "panel_number", "survey_year")
     )
 
 rm(consolidated_stacked, conditions_stacked)
-gc()
+invisible(gc())
+
+# ---------------------------------------------------------------------------
+# Recode CCSR codes to human-readable condition labels in place
+# ---------------------------------------------------------------------------
+ccsr_to_condition <- c(
+    # Diabetes
+    END002 = "diabetes",
+    END003 = "diabetes",
+    END004 = "diabetes",
+    END005 = "diabetes",
+    END006 = "diabetes",
+    # Hyperlipidemia
+    END010 = "hyperlipidemia",
+    # Hypertension
+    CIR007 = "hypertension",
+    CIR008 = "hypertension",
+    # Mental health
+    MBD001 = "mental_health",
+    MBD002 = "mental_health",
+    MBD003 = "mental_health",
+    MBD004 = "mental_health",
+    MBD005 = "mental_health",
+    MBD006 = "mental_health",
+    MBD007 = "mental_health",
+    MBD008 = "mental_health",
+    MBD009 = "mental_health",
+    MBD010 = "mental_health",
+    MBD011 = "mental_health",
+    MBD012 = "mental_health",
+    MBD013 = "mental_health",
+    MBD014 = "mental_health",
+    MBD017 = "mental_health",
+    MBD018 = "mental_health",
+    MBD019 = "mental_health",
+    MBD020 = "mental_health",
+    MBD021 = "mental_health",
+    MBD022 = "mental_health",
+    MBD023 = "mental_health",
+    MBD024 = "mental_health",
+    MBD025 = "mental_health",
+    MBD026 = "mental_health",
+    MBD027 = "mental_health",
+    MBD028 = "mental_health",
+    MBD029 = "mental_health",
+    MBD030 = "mental_health",
+    MBD031 = "mental_health",
+    MBD032 = "mental_health",
+    MBD033 = "mental_health",
+    MBD034 = "mental_health",
+    # Pulmonary disease
+    RSP006 = "pulmonary_disease",
+    RSP007 = "pulmonary_disease",
+    RSP008 = "pulmonary_disease",
+    RSP010 = "pulmonary_disease",
+    RSP011 = "pulmonary_disease",
+    RSP012 = "pulmonary_disease",
+    RSP013 = "pulmonary_disease",
+    RSP014 = "pulmonary_disease",
+    RSP016 = "pulmonary_disease",
+    # Arthritis
+    MUS001 = "arthritis",
+    MUS002 = "arthritis",
+    MUS003 = "arthritis",
+    MUS004 = "arthritis",
+    MUS005 = "arthritis",
+    MUS006 = "arthritis",
+    MUS007 = "arthritis",
+    # Back problems
+    MUS011 = "back_problems",
+    MUS038 = "back_problems",
+    # Heart disease
+    CIR001 = "heart_disease",
+    CIR002 = "heart_disease",
+    CIR003 = "heart_disease",
+    CIR004 = "heart_disease",
+    CIR005 = "heart_disease",
+    CIR006 = "heart_disease",
+    CIR010 = "heart_disease",
+    CIR011 = "heart_disease",
+    CIR012 = "heart_disease",
+    CIR014 = "heart_disease",
+    CIR015 = "heart_disease",
+    CIR016 = "heart_disease",
+    CIR017 = "heart_disease",
+    CIR018 = "heart_disease",
+    # Cerebrovascular disease
+    NVS012 = "cerebrovascular_disease",
+    CIR020 = "cerebrovascular_disease",
+    CIR021 = "cerebrovascular_disease",
+    CIR022 = "cerebrovascular_disease",
+    CIR023 = "cerebrovascular_disease",
+    CIR024 = "cerebrovascular_disease",
+    CIR025 = "cerebrovascular_disease",
+    # Asthma
+    RSP009 = "asthma"
+)
+
+data_joined <- data_joined |>
+    mutate(across(starts_with("ccsr_code"), ~ ccsr_to_condition[.]))
+
+# ---------------------------------------------------------------------------
+# Medicare sample: continuous 12-month coverage
+# Keep only persons covered in all 12 months of the survey year
+# ---------------------------------------------------------------------------
+mcr_months <- c(
+    "mcr_jan",
+    "mcr_feb",
+    "mcr_mar",
+    "mcr_apr",
+    "mcr_may",
+    "mcr_jun",
+    "mcr_jul",
+    "mcr_aug",
+    "mcr_sep",
+    "mcr_oct",
+    "mcr_nov",
+    "mcr_dec"
+)
+
+data_medicare <- data_joined |>
+    filter(if_all(all_of(mcr_months), ~ . == 1))
+
+# ---------------------------------------------------------------------------
+# Reshape to one row per person + clean
+# ---------------------------------------------------------------------------
+
+# Person-level columns (from consolidated) — used to drop condition columns
+person_cols <- c(
+    "person_id",
+    "panel_number",
+    "family_id",
+    "sex",
+    "race",
+    "hispanic",
+    "education",
+    "bmi",
+    "age",
+    "region",
+    "marital_status",
+    "ever_medicare",
+    mcr_months,
+    "total_expenditure",
+    "person_weight",
+    "saq_weight",
+    "variance_stratum",
+    "variance_psu",
+    "survey_year"
+)
+
+# Condition flags: one binary column per condition per person-year
+condition_flags <- data_medicare |>
+    select(person_id, survey_year, starts_with("ccsr_code")) |>
+    pivot_longer(
+        starts_with("ccsr_code"),
+        values_to = "condition",
+        names_to = NULL
+    ) |>
+    filter(!is.na(condition)) |>
+    distinct() |>
+    mutate(present = 1L) |>
+    pivot_wider(names_from = condition, values_from = present, values_fill = 0L)
+
+# Clean person-level data and join condition flags
+data_clean <- data_medicare |>
+    select(all_of(person_cols)) |>
+    distinct(person_id, survey_year, .keep_all = TRUE) |>
+    # 1. BMI: adult only, non-missing, plausible range
+    filter(!is.na(bmi), between(bmi, 10, 100)) |>
+    # 2. Expenditures: non-missing, non-negative
+    filter(!is.na(total_expenditure), total_expenditure >= 0) |>
+    # 3. Survey weights: non-missing, positive
+    filter(!is.na(person_weight), person_weight > 0) |>
+    # 5. Covariates: complete cases
+    filter(
+        !is.na(sex),
+        !is.na(race),
+        !is.na(hispanic),
+        !is.na(education),
+        !is.na(marital_status),
+        !is.na(region)
+    ) |>
+    # Drop redundant monthly Medicare columns (all == 1 by construction)
+    select(-all_of(mcr_months), -ever_medicare) |>
+    inner_join(condition_flags, by = c("person_id", "survey_year")) |>
+    # BMI categories — underweight collapsed into normal due to sparse counts
+    # in the Medicare population (n < 200); not a target group for this study
+    mutate(
+        bmi_category = case_when(
+            bmi < 25.0 ~ "normal_or_below",
+            bmi < 30.0 ~ "overweight",
+            bmi < 35.0 ~ "obese_class_i",
+            bmi < 40.0 ~ "obese_class_ii",
+            bmi >= 40.0 ~ "obese_class_iii"
+        ),
+        bmi_category = factor(
+            bmi_category,
+            levels = c(
+                "normal_or_below",
+                "overweight",
+                "obese_class_i",
+                "obese_class_ii",
+                "obese_class_iii"
+            )
+        )
+    )
+
+rm(data_joined, data_medicare, condition_flags)
+invisible(gc())
+
+# Convert condition flag columns to logical so gtsummary treats them as
+# binary categorical variables rather than continuous integers
+condition_vars <- c(
+    "diabetes",
+    "hypertension",
+    "hyperlipidemia",
+    "mental_health",
+    "pulmonary_disease",
+    "arthritis",
+    "back_problems",
+    "heart_disease",
+    "cerebrovascular_disease",
+    "asthma"
+)
+
+data_clean <- data_clean |>
+    mutate(across(any_of(condition_vars), as.logical))
+
+# ---------------------------------------------------------------------------
+# Survey design object
+# MEPS uses a stratified clustered design — must account for this in all
+# estimates and tests, otherwise standard errors will be wrong
+# ---------------------------------------------------------------------------
+svy_clean <- data_clean |>
+    as_survey_design(
+        ids = variance_psu,
+        strata = variance_stratum,
+        weights = person_weight,
+        nest = TRUE
+    )
+
+# ---------------------------------------------------------------------------
+# Table 1: descriptive statistics by BMI category with p-values
+# Continuous: survey-weighted mean (SD)
+# Categorical/binary: survey-weighted % (n)
+# P-values: Rao-Scott chi-square (categorical), Wald F-test (continuous)
+# ---------------------------------------------------------------------------
+tbl_descriptive <- svy_clean |>
+    tbl_svysummary(
+        by = bmi_category,
+        include = c(
+            age,
+            sex,
+            race,
+            hispanic,
+            education,
+            marital_status,
+            region,
+            total_expenditure,
+            all_of(condition_vars)
+        ),
+        statistic = list(
+            all_continuous() ~ "{mean} ({sd})",
+            all_categorical() ~ "{p}% ({n})"
+        ),
+        digits = list(
+            all_continuous() ~ 1,
+            all_categorical() ~ c(1, 0)
+        ),
+        missing = "no",
+        label = list(
+            age ~ "Age (years)",
+            sex ~ "Sex",
+            race ~ "Race",
+            hispanic ~ "Hispanic ethnicity",
+            education ~ "Education (years)",
+            marital_status ~ "Marital status",
+            region ~ "Census region",
+            total_expenditure ~ "Total expenditure ($)",
+            diabetes ~ "Diabetes",
+            hypertension ~ "Hypertension",
+            hyperlipidemia ~ "Hyperlipidemia",
+            mental_health ~ "Mental health condition",
+            pulmonary_disease ~ "Pulmonary disease",
+            arthritis ~ "Arthritis",
+            back_problems ~ "Back problems",
+            heart_disease ~ "Heart disease",
+            cerebrovascular_disease ~ "Cerebrovascular disease",
+            asthma ~ "Asthma"
+        )
+    ) |>
+    add_p(
+        test = list(
+            all_continuous() ~ "svy.kruskal.test",
+            all_categorical() ~ "svy.chisq.test"
+        )
+    ) |>
+    add_overall() |>
+    bold_labels() |>
+    bold_p(t = 0.05)
+
+tbl_descriptive
+data_clean <- data_clean |>
+    mutate(
+        bmi_category = fct_collapse(
+            bmi_category,
+            "normal_or_below" = c("underweight", "normal")
+        )
+    )
