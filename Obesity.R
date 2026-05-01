@@ -29683,4 +29683,7 @@ consolidated_stacked <- bind_rows(h224, h233, h243, h251)
 # will appear on multiple rows)
 
 data_joined <- consolidated_stacked |>
-    inner_join(conditions_stacked, by = c("person_id", "survey_year"))
+    inner_join(
+        conditions_stacked,
+        by = c("person_id_duid_pid" = "person_id", "survey_year")
+    )
